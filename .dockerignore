@@ -1,0 +1,13 @@
+.git
+.gitignore
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+.env
+dist/
+build/
+release/
+.venv/
+venv/
+kiro_requests/

@@ -1,0 +1,408 @@
+"""OpenAI 协议处理 - /v1/chat/completions"""
+import json
+import uuid
+import time
+import asyncio
+import httpx
+from datetime import datetime
+from fastapi import Request, HTTPException
+from fastapi.responses import StreamingResponse
+
+from ..config import KIRO_API_URL, map_model_name
+from ..core import state, is_retryable_error, stats_manager, apply_model_routing
+from ..core.state import RequestLog
+from ..core.history_manager import HistoryManager, get_history_config, is_content_length_error
+from ..core.error_handler import classify_error, ErrorType, format_error_log
+from ..core.rate_limiter import get_rate_limiter
+from ..kiro_api import build_headers, build_kiro_request, parse_event_stream, is_quota_exceeded_error
+from ..converters import generate_session_id, convert_openai_messages_to_kiro, extract_images_from_content
+from ..core.thinking import (
+    ThinkingConfig,
+    build_thinking_prompt,
+    extract_thinking_config_from_openai_body,
+    infer_thinking_from_openai_messages,
+    strip_thinking_from_history,
+    strip_thinking_from_text,
+)
+
+# 尝试导入 tiktoken，如果失败则使用估算方法
+try:
+    import tiktoken
+    _encoding = tiktoken.get_encoding("cl100k_base")
+    _USE_TIKTOKEN = True
+    print("[TokenCounter] 使用 tiktoken (cl100k_base) 进行 token 计数")
+except ImportError:
+    _encoding = None
+    _USE_TIKTOKEN = False
+    print("[TokenCounter] tiktoken 未安装，使用字符估算方法")
+
+
+def _estimate_tokens(text: str) -> int:
+    """估算/计算 token 数量
+    
+    优先使用 tiktoken (cl100k_base)，否则使用字符估算：
+    - 中文字符：约 1.5 字符 = 1 token
+    - 其他字符：约 4 字符 = 1 token
+    """
+    if not text:
+        return 0
+    
+    if _USE_TIKTOKEN and _encoding:
+        return len(_encoding.encode(text))
+    
+    # 回退到字符估算
+    chinese_chars = sum(1 for c in text if '\u4e00' <= c <= '\u9fff')
+    other_chars = len(text) - chinese_chars
+    tokens = int(chinese_chars / 1.5) + int(other_chars / 4)
+    return max(1, tokens)
+
+
+def _estimate_input_tokens(messages: list, tools: list = None) -> int:
+    """估算/计算输入 token 数量"""
+    total = 0
+    
+    for msg in messages or []:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += _estimate_tokens(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    total += _estimate_tokens(part.get("text", ""))
+        # 角色和消息结构开销
+        role = msg.get("role", "")
+        total += _estimate_tokens(role) + 4  # 每条消息的结构开销
+    
+    # 工具定义开销
+    if tools:
+        tools_json = json.dumps(tools)
+        total += _estimate_tokens(tools_json)
+    
+    return max(1, total)
+
+
+async def handle_chat_completions(request: Request):
+    """处理 /v1/chat/completions 请求"""
+    start_time = time.time()
+    log_id = uuid.uuid4().hex[:8]
+    
+    body = await request.json()
+    model_raw = apply_model_routing(body.get("model", "claude-sonnet-4"))
+    model = map_model_name(model_raw)
+    messages = body.get("messages", [])
+    stream = body.get("stream", False)
+    tools = body.get("tools", None)
+    tool_choice = body.get("tool_choice", None)
+
+    thinking_cfg, thinking_explicit = extract_thinking_config_from_openai_body(body)
+    # 移除自动推断逻辑 - 只有用户明确启用时才使用思维链
+    # if not thinking_explicit and infer_thinking_from_openai_messages(messages):
+    #     thinking_cfg = ThinkingConfig(True, None)
+    
+    if not messages:
+        raise HTTPException(400, "messages required")
+    
+    session_id = generate_session_id(messages)
+    account = state.get_available_account(session_id)
+    
+    if not account:
+        raise HTTPException(503, "All accounts are rate limited or unavailable")
+    
+    # 检查 token 是否即将过期，尝试刷新
+    if account.is_token_expiring_soon(5):
+        print(f"[OpenAI] Token 即将过期，尝试刷新: {account.id}")
+        success, msg = await account.refresh_token()
+        if not success:
+            print(f"[OpenAI] Token 刷新失败: {msg}")
+    
+    token = account.get_token()
+    if not token:
+        raise HTTPException(500, f"Failed to get token for account {account.name}")
+    
+    # 使用账号的动态 Machine ID（提前构建，供摘要使用）
+    creds = account.get_credentials()
+    headers = build_headers(
+        token,
+        machine_id=account.get_machine_id(),
+        profile_arn=creds.profile_arn if creds else None,
+        client_id=creds.client_id if creds else None
+    )
+    
+    # 限速检查
+    rate_limiter = get_rate_limiter()
+    can_request, wait_seconds, reason = rate_limiter.can_request(account.id)
+    if not can_request:
+        print(f"[OpenAI] 限速: {reason}")
+        await asyncio.sleep(wait_seconds)
+    
+    # 使用增强的转换函数
+    user_content, history, tool_results, kiro_tools = convert_openai_messages_to_kiro(
+        messages, model, tools, tool_choice
+    )
+    
+    # 历史消息预处理
+    history_manager = HistoryManager(get_history_config(), cache_key=session_id)
+    
+    async def call_summary(prompt: str) -> str:
+        req = build_kiro_request(prompt, "claude-haiku-4.5", [])
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=60) as client:
+                resp = await client.post(KIRO_API_URL, json=req, headers=headers)
+                if resp.status_code == 200:
+                    return parse_event_stream(resp.content)
+        except Exception as e:
+            print(f"[Summary] API 调用失败: {e}")
+        return ""
+
+    # 检查是否需要智能摘要或错误重试预摘要
+    if history_manager.should_summarize(history) or history_manager.should_pre_summary_for_error_retry(history, user_content):
+        history = await history_manager.pre_process_async(history, user_content, call_summary)
+    else:
+        history = history_manager.pre_process(history, user_content)
+    
+    # 摘要/截断后再次修复历史交替和 toolUses/toolResults 配对
+    from ..converters import fix_history_alternation
+    history = fix_history_alternation(history)
+    
+    if history_manager.was_truncated:
+        print(f"[OpenAI] {history_manager.truncate_info}")
+
+    
+    # 提取最后一条消息中的图片
+    images = []
+    if messages:
+        last_msg = messages[-1]
+        if last_msg.get("role") == "user":
+            _, images = extract_images_from_content(last_msg.get("content", ""))
+
+    # kiro.rs 风格：单阶段处理，直接发送带思维链配置的请求
+    if thinking_cfg.enabled:
+        # 使用思维链配置构建请求
+        main_user_content = build_thinking_prompt(
+            user_content=user_content,
+            budget_tokens=thinking_cfg.budget_tokens,
+            history=history,
+            has_tool_results=bool(tool_results)
+        )
+    else:
+        main_user_content = user_content
+
+    kiro_request = build_kiro_request(
+        main_user_content,
+        model,
+        history,
+        images=images,
+        tools=kiro_tools if kiro_tools else None,
+        tool_results=tool_results if tool_results else None,
+    )
+    
+    error_msg = None
+    status_code = 200
+    content = ""
+    current_account = account
+    max_retries = 2
+    
+    for retry in range(max_retries + 1):
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=120) as client:
+                resp = await client.post(KIRO_API_URL, json=kiro_request, headers=headers)
+                status_code = resp.status_code
+                
+                # 仅 429 状态码触发冷却和账号切换
+                if resp.status_code == 429:
+                    current_account.mark_quota_exceeded("Rate limited")
+                    
+                    # 尝试切换账号
+                    next_account = state.get_next_available_account(current_account.id)
+                    if next_account and retry < max_retries:
+                        print(f"[OpenAI] 429 限流，切换账号: {current_account.id} -> {next_account.id}")
+                        current_account = next_account
+                        token = current_account.get_token()
+                        creds = current_account.get_credentials()
+                        headers = build_headers(
+                            token,
+                            machine_id=current_account.get_machine_id(),
+                            profile_arn=creds.profile_arn if creds else None,
+                            client_id=creds.client_id if creds else None
+                        )
+                        continue
+                    
+                    raise HTTPException(429, "All accounts rate limited")
+                
+                # 处理可重试的服务端错误（不触发冷却，仅重试）
+                if is_retryable_error(resp.status_code):
+                    if retry < max_retries:
+                        print(f"[OpenAI] 服务端错误 {resp.status_code}，重试 {retry + 1}/{max_retries}")
+                        await asyncio.sleep(0.5 * (2 ** retry))
+                        continue
+                    raise HTTPException(resp.status_code, f"Server error after {max_retries} retries")
+                
+                if resp.status_code != 200:
+                    error_msg = resp.text
+                    print(f"[OpenAI] Kiro API error {resp.status_code}: {resp.text[:500]}")
+                    
+                    # 使用统一的错误处理
+                    error = classify_error(resp.status_code, error_msg)
+                    print(format_error_log(error, current_account.id))
+                    
+                    # 账号封禁 - 禁用账号
+                    if error.should_disable_account:
+                        current_account.enabled = False
+                        if hasattr(current_account, "auto_disabled"):
+                            current_account.auto_disabled = False
+                        from ..credential import CredentialStatus
+                        current_account.status = CredentialStatus.SUSPENDED
+                        try:
+                            state._save_accounts()
+                        except Exception:
+                            pass
+                        print(f"[OpenAI] 账号 {current_account.id} 已被禁用 (封禁)")
+                    
+                    # 仅 429 状态码触发冷却
+                    elif resp.status_code == 429:
+                        current_account.mark_quota_exceeded(error_msg[:100])
+                    
+                    # 其他错误（非 429、非内容过长）- 异步检查额度
+                    elif error.type != ErrorType.CONTENT_TOO_LONG:
+                        from .anthropic import _check_and_disable_if_exhausted
+                        asyncio.create_task(_check_and_disable_if_exhausted(current_account))
+                    
+                    # 尝试切换账号（仅账号封禁时）
+                    if error.should_disable_account:
+                        next_account = state.get_next_available_account(current_account.id)
+                        if next_account and retry < max_retries:
+                            print(f"[OpenAI] 切换账号: {current_account.id} -> {next_account.id}")
+                            current_account = next_account
+                            headers["Authorization"] = f"Bearer {current_account.get_token()}"
+                            continue
+                    
+                    # 检查是否为内容长度超限错误，尝试截断重试
+                    if error.type == ErrorType.CONTENT_TOO_LONG:
+                        history_chars, user_chars, total_chars = history_manager.estimate_request_chars(
+                            history, main_user_content
+                        )
+                        print(f"[OpenAI] 内容长度超限: history={history_chars} chars, user={user_chars} chars, total={total_chars} chars")
+                        truncated_history, should_retry = await history_manager.handle_length_error_async(
+                            history, retry, call_summary
+                        )
+                        if should_retry:
+                            print(f"[OpenAI] 内容长度超限，{history_manager.truncate_info}")
+                            history = truncated_history
+                            kiro_request = build_kiro_request(
+                                main_user_content, model, history,
+                                images=images,
+                                tools=kiro_tools if kiro_tools else None,
+                                tool_results=tool_results if tool_results else None
+                            )
+                            continue
+                        else:
+                            reason = f" ({history_manager.truncate_info})" if history_manager.truncate_info else ""
+                            print(f"[OpenAI] 内容长度超限但未重试: retry={retry}/{max_retries}{reason}")
+                    
+                    raise HTTPException(resp.status_code, error.user_message)
+                
+                content = parse_event_stream(resp.content)
+                current_account.request_count += 1
+                current_account.last_used = time.time()
+                get_rate_limiter().record_request(current_account.id)
+                break
+                
+        except HTTPException:
+            raise
+        except httpx.TimeoutException:
+            error_msg = "Request timeout"
+            status_code = 408
+            if retry < max_retries:
+                print(f"[OpenAI] 请求超时，重试 {retry + 1}/{max_retries}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
+            raise HTTPException(408, "Request timeout after retries")
+        except httpx.ConnectError:
+            error_msg = "Connection error"
+            status_code = 502
+            if retry < max_retries:
+                print(f"[OpenAI] 连接错误，重试 {retry + 1}/{max_retries}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
+            raise HTTPException(502, "Connection error after retries")
+        except Exception as e:
+            error_msg = str(e)
+            status_code = 500
+            # 检查是否为可重试的网络错误
+            if is_retryable_error(None, e) and retry < max_retries:
+                print(f"[OpenAI] 网络错误，重试 {retry + 1}/{max_retries}: {type(e).__name__}")
+                await asyncio.sleep(0.5 * (2 ** retry))
+                continue
+            raise HTTPException(500, str(e))
+    
+    # 记录日志
+    duration = (time.time() - start_time) * 1000
+    state.add_log(RequestLog(
+        id=log_id,
+        timestamp=time.time(),
+        method="POST",
+        path="/v1/chat/completions",
+        model=model,
+        account_id=current_account.id if current_account else None,
+        status=status_code,
+        duration_ms=duration,
+        error=error_msg
+    ))
+    
+    # 记录统计
+    stats_manager.record_request(
+        account_id=current_account.id if current_account else "unknown",
+        model=model,
+        success=status_code == 200,
+        latency_ms=duration
+    )
+    
+    # 估算 token 数量
+    prompt_tokens = _estimate_input_tokens(messages, tools)
+    # kiro.rs 风格：内容已经包含思维链，直接处理
+    if thinking_cfg.enabled:
+        content = strip_thinking_from_text(content)
+
+    display_content = content
+    completion_tokens = _estimate_tokens(display_content)
+    total_tokens = prompt_tokens + completion_tokens
+    
+    if stream:
+        async def generate():
+            for chunk in [display_content[i:i+20] for i in range(0, len(display_content), 20)]:
+                data = {
+                    "id": f"chatcmpl-{log_id}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"content": chunk}, "finish_reason": None}]
+                }
+                yield f"data: {json.dumps(data)}\n\n"
+                await asyncio.sleep(0.02)
+            
+            # 最后一个 chunk 包含 usage 信息
+            end_data = {
+                "id": f"chatcmpl-{log_id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+            }
+            yield f"data: {json.dumps(end_data)}\n\n"
+            yield "data: [DONE]\n\n"
+        
+        return StreamingResponse(generate(), media_type="text/event-stream")
+    
+    return {
+        "id": f"chatcmpl-{log_id}",
+        "object": "chat.completion",
+        "created": int(datetime.now().timestamp()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": display_content},
+            "finish_reason": "stop"
+        }],
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": total_tokens}
+    }

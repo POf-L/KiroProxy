@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+.hypothesis/
+.pytest_cache/
+
+# Build
+build/
+dist/
+release/
+*.spec
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# HAR files (contain sensitive data)
+*.har
+
+# Logs
+*.log
+
+# Test files
+[0-9].txt
+[0-9][0-9].txt
+线索*.txt
+
+# Temp analysis files
+flows
+flows_*
+traffic.mitm
+*.mitm
+kiro_requests/
+analyze_har.py
+parse_*.py
+*_analysis.txt
+*_check.txt
+hex_dump.txt
+parsed_*.txt
+response.txt
+参考.txt
+
+# Other projects
+Antigravity-Manager/
+cc-switch/
